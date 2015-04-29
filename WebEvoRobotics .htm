@@ -1,0 +1,1391 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<!-- saved from url=(0055)http://webcl.nokiaresearch.com/tutorials/tutorial1.html -->
+<html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+  
+  <title>Evolutionary Robotics Web Simulator</title>
+  <meta name="keywords" content="deep reinforcement learning", "deep evolutionary learning", "evolutionary robotics, deep learning, webcl, webgl, gpu, opencl, opengl">
+  <meta name="description" content="WebCL extension for Firefox, providing direct GPU access from JavaScript">
+  <link href="./default.css" rel="stylesheet" type="text/css">
+</head>
+
+<body id="tutorial">
+
+<div id="header">
+  <div id="logo">
+	<h1>Evolutionary Learning</h1>
+  </div>  <!-- end div#logo -->
+</div> <!-- end div#header -->
+
+<div id="page">
+  <div id="page-bgtop">
+    <div id="content">
+
+      <!-- <div class="post box" width="700" height="500">-->
+ 			<style type="text/css">
+				canvas { border: 10px solid; }
+			</style>
+		
+
+			<script id="clMoveRobot" type="text/x-opencl">
+
+				/* Kernel Definition */
+			
+				// Robot structure
+				typedef struct {
+					float2 pos;											// Structure must from the greater to the smaller (in bytes) 
+					float2 oldPos;					
+					float2 rot;					
+					float angle;
+					float oldAngle;					
+					float radius;
+				} Robot;
+
+				/* Utilities */
+				
+				// Read the robot parameters from the linearized buffered vector 
+				inline Robot readRobotsBuffer(__global float* robots, uint robotIndex) {
+					Robot r; 
+ 
+					r.pos = (float2) (robots[robotIndex], robots[1+robotIndex]); 																	// Your need to do always explicit casting in this kind of assignments		
+					r.oldPos = (float2) (robots[2+robotIndex], robots[3+robotIndex]);
+					r.angle = robots[4+robotIndex];
+					r.oldAngle = robots[5+robotIndex];
+					r.radius = robots[6+robotIndex];
+					r.rot = (float2) (robots[7+robotIndex], robots[8+robotIndex]);
+					
+					return r;
+				}
+					
+				// Save the robot parameters to the linearized buffered vector 
+				inline void saveRobotsBuffer(Robot r, __global float* robots, uint robotIndex) {
+					robots[robotIndex] = r.pos.x; 
+					robots[1+robotIndex] = r.pos.y; 
+					robots[2+robotIndex] = r.oldPos.x; 
+					robots[3+robotIndex] = r.oldPos.y; 
+					robots[4+robotIndex] = r.angle; 
+					robots[5+robotIndex] = r.oldAngle; 
+					robots[6+robotIndex] = r.radius; 
+					robots[7+robotIndex] = r.rot.s0; 
+					robots[8+robotIndex] = r.rot.s1; 
+				}
+
+				// Vector rotation function
+				inline float2 rotateVec(float2 v, float angle) {
+					return (float2) (v.x*cos(angle)+v.y*sin(angle), -v.x*sin(angle)+v.y*cos(angle));												// Rotation formulas 
+				}
+
+				// Motion Kernel 
+				//kernel void moveRobot(__global double* robots, __private uint numOfRobotsParams, __private uint numOfRobots, __private double envWidth, __private double envHeight, __private double borderWallsGap) {	// double for typeNBit = 64 bit
+				kernel void moveRobot(__global float* robots, __private uint numOfRobotsParams, __private uint numOfRobots, __private float envWidth, __private float envHeight, __private float borderWallsGap) {			// float for typeNBit = 32 bit
+					Robot r; 
+
+					uint i = 0; 
+					
+					float2 leftWheelPos, rightWheelPos, vv, vv2, np, np2; 
+					float wheelAng; 
+					
+					// Grid ND Range doesn't work actually
+					uint gid0 = get_global_id(0);																						// Getting the global id of the current kernel instance, for the dimension 0 - number of trial
+					uint gid1 = get_global_id(1);																						// Getting the global id of the current kernel instance, for the dimension 1 - number of robot
+					
+					uint robotIndex = gid1*numOfRobotsParams+gid0*numOfRobots*numOfRobotsParams;										// Calculate the right linearization index to access robots linear array
+
+					r = readRobotsBuffer(robots, robotIndex); 																			// Read the robot parameters from the linearized buffered vector 
+
+					// Begin of motion algorithm 
+					r.oldPos = r.pos; 																									// back up old position	
+					r.oldAngle = r.angle; 																								// back up old angle
+					
+					// move and turn the robot according to the wheel velocities
+					// first take the position of the point between the front and the center of the robot (0, a.rad / 2.0)
+					// then the position of the left wheel, if the robot pos was 0,0 , that is the previous point rotated of the robot angle + 90 degrees		
+					leftWheelPos = (float2) r.pos + rotateVec((float2) (0.0f, r.radius / 2.0f), r.angle + M_PI_2);						// determine the absolute position of the left wheel, adding the robot central position to ideal wheel position
+					rightWheelPos = (float2) r.pos - rotateVec((float2) (0.0f, r.radius / 2.0f), r.angle + M_PI_2);						// determine the absolute position of the right wheel, that is on the opposite side
+
+					r.pos = (float2) 0.5f * (rightWheelPos + rotateVec((float2) r.pos - rightWheelPos, -r.rot.s0))+						// Add the right wheel move component with the left wheel move component
+							(float2) 0.5f * (leftWheelPos + rotateVec((float2) r.pos - leftWheelPos, r.rot.s1)); 
+					
+					r.angle -= r.rot.s0; 																								// Angle update
+					if (r.angle<0.0f)																									// Angle correction if negative	
+						r.angle += 2.0f*M_PI;
+					
+					r.angle += r.rot.s1;																								// Angle update
+					if (r.angle > 2.0f*M_PI)																							// Angle correction if over 2PI
+						r.angle -= 2.0f*M_PI;
+
+					// handle boundary conditions
+					if (r.pos.x<borderWallsGap+r.radius+1)	
+						r.pos.x=borderWallsGap+r.radius+1;
+					if (r.pos.x>envWidth-borderWallsGap-r.radius-1)
+						r.pos.x=envWidth-borderWallsGap-r.radius-1;
+					if (r.pos.y<borderWallsGap+r.radius+1)
+						r.pos.y=borderWallsGap+r.radius+1;
+					if (r.pos.y>envHeight-borderWallsGap-r.radius-1)
+						r.pos.y=envHeight-borderWallsGap-r.radius-1;
+				
+					saveRobotsBuffer(r, robots, robotIndex); 											// Save the robot parameters from the linearized buffered vector 
+					
+					// Test of Grid 1 Ok
+					//robots[0+robotIndex]=gid0;
+					//robots[1+robotIndex]=gid1;
+				}
+            </script>
+			
+			
+			
+			<script type="text/javascript">
+
+				/* Variables definition */
+
+				// Globals				
+				var canvas, ctx; 																// Canvas and context
+				var w; 																			// Environment
+				var current_interval_id;												
+				var skipdraw = false;
+				var x,y,t,c,k,j;																// Elements coordinates, type and colours		
+
+				// Simulation Parameters
+				var borderWallsGap = 20;
+				var numOfIndividuals = 1; 														// Number of Individuals for the Genetic Algorithm 
+				var numOfEnvElements = 29; 
+				var robotsRadius = 20; 
+				var elementsRadius = 10; 
+				var numOfRobots = 12;															// Number of Robots within the Environment
+				var numOfRobotsParams = 9;
+				var numOfRobotsWhiskers = 0; 													// Number of Robots' whiskers
+				var numOfRobotsPhotoreceptors = 5; 												// Number of Robots' Photoreceptors, only if whiskers disabled
+				var photoReceptorsResolution = 0.06;											// Photo Receptors Resolution in Radiants: how many beams the photoreceptors has. If 0 it works like whiskers
+				var robotsWhiskersRange = Math.PI / 2.0;										// Robots Whiskers Angle Range
+				var robotsFOV = Math.PI / 2.0; 													// Robots Field of View	
+				var totTrials = 1;																// Number of Trials
+				var totTimeSteps = 5000; 														// Number of Time Steps
+				
+				// Display parameters
+				var randomColoredItems = 1; 													// Random Colored food
+				var photoReceptorsRayMaxLength = 0;												// Lenght of Photo Receptors Beam, if 0 it will end up to the seen object	
+				var blinkingRobots = 0; 														// Robots blink 
+				var robotsColor = "rgb(255, 20, 20)";											// Default robots Color
+			
+				
+				// General Parameters
+				var visualizationPrec = 2;														// number of digits to show
+				var runOnGPU = 1; 																// 0: run without GPU, 1: run with GPU
+				var currentTrial = 0; 															// The trial to be displayed	
+				var simulationSpeed = 0;														// Speed of the simulation
+				var disableWarnings = 0; 														// Disable the exceptions visualization			
+				var disableOutput = 0; 															// Disable the output visualization
+				var CPUSimulationSpeed = 0; 													// Speed of Simulation on CPU	
+				var GPUSimulationSpeed = 0; 													// Speed of Simulation on GPU	
+				var current_interval_id = 0; 													// Variable to setInterval	
+				
+				// WebCL Parameters  
+				var clRobotsBuffer;																// WebCL Buffer for robots array 
+				var motionContext;																// Setup WebCL context using the default device
+				var motionKernelSrc;															// Motion Kernel Source				
+				var motionProgram;																// Motion Program 					
+				var motionDevice;																// Motion Device
+				var motionKernel;																// Motion Kernel
+				var motionRobotsQueue;															// Motion Robots Queue
+				var typesNBit=32; 																// set the number of bits 				
+				var robots; 
+				var numOfRobotsElements;
+				var bufRobotsSize;
+				var motionGlobalWS = [totTrials, numOfRobots];									// Set Initial Motion ND-range, try to understand why i cannot update this later			
+				
+				/* Utilities Functions */
+				
+				//Get the X-axis of a segment extremity from the point with x X-axis, with angle "angle" and at the distance "length"
+				function GetXPointAtDist(x, length, angle) {
+					return x + length * Math.sin(angle);				// We have: x+sin(a), because the X-axis of the screen corresponds to Y-axis of the trigonometric circumference and viceversa.            
+				}
+
+				//Get the Y-axis of a segment extremity from the point with y Y-axis, with angle "angle" and at the distance "length"
+				function GetYPointAtDist(y, length, angle) {
+					return y + length * Math.cos(angle);				// We have: y+cos(a), because the Y-axis of the screen corresponds to X-axis of the trigonometric circumference and viceversa.            
+				}
+				
+				// Generate Random Numbers between min and max
+				function getRandom(min, max) {
+					//return Math.floor(Math.random() * (max - min)) + min;
+					return Math.random() * (max - min) + min;
+				}				
+
+				// Round a number to the second digit
+				function roundToTwo(num) {    
+					return Math.round(num * 100) / 100;
+				}
+				
+				// Create a 2 dimensional array. The number of columns does not really matter 
+				function create2DArray(rows) {
+					var arr = [];
+			
+					for (var i=0;i<rows;i++) {
+						arr[i] = [];
+					}
+
+					return arr;
+				}
+				
+				// Builds the array of walls, starting from a point (x,y) with height h and weight w
+				var util_add_box = function(lst, x, y, w, h) {
+					lst.push(new Wall(new Vec(x,y), new Vec(x+w,y)));					// Upper line 			
+					lst.push(new Wall(new Vec(x+w,y), new Vec(x+w,y+h)));				// Right line
+					lst.push(new Wall(new Vec(x+w,y+h), new Vec(x,y+h)));				// Lower line
+					lst.push(new Wall(new Vec(x,y+h), new Vec(x,y)));					// Left line
+				}
+				
+				/* OpenCL Functions */
+
+				// Load a kernel function  
+				function loadKernel(id){
+
+					var kernelElement = document.getElementById(id);
+					var kernelSource = kernelElement.text;
+
+					if (kernelElement.src != "") {
+						var mHttpReq = new XMLHttpRequest();
+						mHttpReq.open("GET", kernelElement.src, false);
+						mHttpReq.send(null);
+						kernelSource = mHttpReq.responseText;
+					} 
+
+					return kernelSource;
+				}
+
+				/* Class Definitions */
+				
+				// A 2D vector utility
+				var Vec = function(x, y) {
+					this.x = x;
+					this.y = y;
+				}
+				Vec.prototype = {
+					dist_from: function(v) { 
+						return Math.sqrt(Math.pow(this.x-v.x,2) + Math.pow(this.y-v.y,2)); 
+					},
+						
+					length: function() { 
+						return Math.sqrt(Math.pow(this.x,2) + Math.pow(this.y,2)); 
+					},
+      
+					// new vector returning operations
+					add: function(v) { 
+						return new Vec(this.x + v.x, this.y + v.y); 
+					},
+					sub: function(v) { 
+						return new Vec(this.x - v.x, this.y - v.y); 
+					},
+					rotate: function(a) {  // CLOCKWISE
+						return new Vec(this.x * Math.cos(a) + this.y * Math.sin(a),-this.x * Math.sin(a) + this.y * Math.cos(a));	
+						//return new Vec(this.x * Math.cos(a) - this.y * Math.sin(a),this.x * Math.sin(a) + this.y * Math.cos(a));	// ANTICLOCKWISE
+					},
+      
+					// in place operations
+					scale: function(s) { 
+						this.x *= s; this.y *= s; 
+					},
+					
+					normalize: function() { 
+						var d = this.length(); this.scale(1.0/d); 
+					}
+				}
+
+				// Compute the intersection between a segment p1-p2 and a circumference p0,rad
+				// This algorithm uses the fast method of considering p1-p2 the base of triangle and h the height as the distance from the centre
+/*				function segmentCircleIntersect(p1,p2,c,rad) {
+					
+					//area2 = Math.abs((p2.x-p1.x)*(c.y-p1.y)-(c.x-p1.x)*(p2.y-p1.y));				// compute the triangle area times 2 (area = area2/2)
+					// Calculate the length of all the 3 sides of the triangle made of the vertices : p1,p2,c
+					var A = p1.dist_from(p2); 
+					var B = c.dist_from(p1); 
+					var C = c.dist_from(p2); 
+					
+					var S = (A + B + C) / 2.0; 															// A half of the perimeter
+					var Area = Math.sqrt(S * (S-A) * (S-B) * (S-C)); 									// Herons's formula
+					
+					var h = Area * 2.0 / A;																// Compute the triangle height, that is the distance from the segment to the circle	
+
+					//output.innerHTML += "A,B,C : " + A + " , " + B + " , " + C + "," + h + "," + rad + "    |    ";							
+					
+					if ((h < rad) && (B<A) && (C<A))													// if the line intersects the circle, height is less than the circle's radius, and the distances 
+																										// between the centre and extremes must be less than the segment length	
+					{
+						return true; 
+					}        
+					
+					return false; 
+				}
+*/
+				function segmentCircleIntersect(p1,p2,c,rad) {
+					//int intersectSegmentCircle(float4 s, float2 c, float r , float4 *ip)
+					//*ip = (0.0f,0.0f,0.0f,0.0f);						// intersetp points 1 and 2	
+					var intersection = 0;
+
+					var a = (p2.x - p1.x)*(p2.x - p1.x) + (p2.y - p1.y)*(p2.y - p1.y); 
+					var b = 2.0 * ((p2.x - p1.x) * (p1.x - c.x) + (p2.y - p1.y) * (p1.y - c.y));
+					var cc = (c.x)*(c.x) + (c.y)*(c.y) + (p1.x)*(p1.x) + (p1.y)*(p1.y) - 2.0 * (c.x * p1.x + c.y * p1.y) - (rad * rad);
+					
+					var deter = (b*b) - 4.0 * a * cc;  
+					
+					if (deter <= 0) 
+						intersection = 0; 
+					else {
+						var e = Math.sqrt(deter); 
+						var u1 = (-b + e) / (2.0 * a); 
+						var u2 = (-b - e) / (2.0 * a); 
+
+						if ((u1 < 0 || u1 > 1) && (u2 < 0 || u2 > 1)) {
+							if ((u1 < 0 && u2 < 0) || (u1 > 1 && u2 > 1))
+								intersection = 0;									// no intersection		
+							else
+								intersection = 2;									// segment inside the circle 
+						} else {
+							ix = p1.x + u2 * (p2.x - p1.x);
+							iy = p1.y + u2 * (p2.y - p1.y);
+							intersection = [ix, iy];								// intersection occured 
+						}
+					}
+				
+					return intersection;
+				}	
+
+				// Simulation Objects
+			
+				// Environment's objects are food and other
+				// item is circle thing on the floor that agent can interact with (see or eat, etc)
+				var Item = function(x, y, type) {
+					this.p = new Vec(x, y); 						// position
+					this.type = type;
+					this.rad = elementsRadius; 						// default radius
+					this.age = 0;
+					this.cleanup_ = false;
+					/*this.rColor = 180.0;							// Red component of the robot's colour
+					this.gColor = 235.0;							// Green component of the robot's colour
+					this.bColor = 235.0;							// Blue component of the robot's colour
+					/*this.rColor = 255.0;							// Red component of the robot's colour
+					this.gColor = 0.0;								// Green component of the robot's colour
+					this.bColor = 0.0;								// Blue component of the robot's colour*/
+					this.rColor = Math.floor(getRandom(0, 256));	// Red component of the robot's colour
+					this.gColor = Math.floor(getRandom(0, 256));	// Green component of the robot's colour
+					this.bColor = Math.floor(getRandom(0, 256));	// Blue component of the robot's colour
+				}
+			
+			    // Wall is made up of two points
+				var Wall = function(p1, p2) {
+					this.p1 = p1;
+					this.p2 = p2;
+				}
+				
+				// Whisker sensor has a maximum range and senses walls
+				var Whisker = function(angle) {
+					this.angle = angle; 												// angle relative to agent its on
+					this.maxDistance = 85;
+					this.objectDistance = 85;				 							// Distance between the perceived object and the robot centre
+					this.sensed_type = -1; 												// what does the whisker perceive?
+					this.perceivedRColor = 0.0;											// Perceived Red Component 0-255
+					this.perceivedGColor = 0.0;											// Perceived Green Component 0-255
+					this.perceivedBColor = 0.0;											// Perceived Blue Component 0-255
+				}
+				
+				// Photoreceptor has a maximum range and senses walls
+				var Photoreceptor = function(angle) {
+					this.angle = angle; 												// angle relative to agent its on
+					this.maxDistance = 85;
+					this.objectDistance = 85; 											// Distance between the perceived object and the robot centre
+					this.sensed_type = -1; 												// what does the photoreceptor see?
+					this.perceivedRColor = 0.0;											// Perceived Red Component 0-255
+					this.perceivedGColor = 0.0;											// Perceived Green Component 0-255
+					this.perceivedBColor = 0.0;											// Perceived Blue Component 0-255
+				}
+				
+				// The Robot Class
+				var Agent = function(number) {
+					var photoRPortionAngle;
+					var photoAngle; 
+					
+					this.rad = robotsRadius;													// Robot radius
+    				this.p = new Vec(getRandom(borderWallsGap+this.rad+1, canvas.width-borderWallsGap-this.rad-1), getRandom(borderWallsGap+this.rad+1, canvas.height-borderWallsGap-this.rad-1)); 					// Robot's position
+    				//this.p = new Vec(100.0, 100.0);							 					// Robot's position
+					
+					this.op = this.p; 															// Old position
+					this.number = number; 														// Number of Robot within the Environment			
+					this.rColor = Math.floor(getRandom(0, 256));								// Red component of the robot's colour
+					this.gColor = Math.floor(getRandom(0, 256));								// Green component of the robot's colour
+					this.bColor = Math.floor(getRandom(0, 256));								// Blue component of the robot's colour
+					//			robot.leftWheelVelocity = getRandom(-1, +1);
+					//			robot.rightWheelVelocity = getRandom(-1, +1);
+					this.leftWheelVelocity = 0; 												// The velocity of the robot's left wheel 	
+					this.rightWheelVelocity = 0; 												// The velocity of the robot's right wheel 	
+					this.angle = getRandom(0, Math.PI*2);										// Face direction
+					//this.angle = Math.PI / 2.0;
+					this.wheelDist = 0;															// The distance between the robot's wheels
+					this.crash = 0;																// Robot Crash Indicator
+      
+					// robot allowed actions
+					this.actions = [];															// 5 pre-set wheel speeds according to the picked action
+					this.actions.push([1,1]);						
+					this.actions.push([0.8,1]);
+					this.actions.push([1,0.8]);
+					this.actions.push([0.5,0]);
+					this.actions.push([0,0.5]);
+      
+					// Sensors
+					if (numOfRobotsWhiskers>0) {
+						this.whiskers = [];
+		
+						for(var wi=0; wi<numOfRobotsWhiskers; wi++) { 
+							whiskerPortionAngle=robotsWhiskersRange / numOfRobotsWhiskers;												// The angle managed by each whisker
+						
+							if (numOfRobotsWhiskers % 2==0)																				// If the number of whiskers is even then add a correction to the angle	
+								angleCorrection = whiskerPortionAngle / 2.0; 
+							else 
+								angleCorrection = 0.0; 
+						
+							whiskerAngle = ((wi-Math.floor(numOfRobotsWhiskers/2.0))*whiskerPortionAngle+angleCorrection)*(-1.0); 		// Calculate the angle of each whisker, 0 - is the one to the left 
+						
+							this.whiskers.push(new Whisker(whiskerAngle));																// Load the new whisker 														
+						}
+					} else if (numOfRobotsPhotoreceptors>0) {	
+						this.photoreceptors = [];
+		
+						for(var pi=0; pi<numOfRobotsPhotoreceptors; pi++) { 
+							photoRPortionAngle=robotsFOV / numOfRobotsPhotoreceptors;													// The angle managed by each photoreceptor
+						
+							if (numOfRobotsPhotoreceptors % 2==0)																		// If the number of photoreceptors is even then add a correction to the angle	
+								angleCorrection = photoRPortionAngle / 2.0; 
+							else 
+								angleCorrection = 0.0; 
+						
+							photoAngle = ((pi-Math.floor(numOfRobotsPhotoreceptors/2.0))*photoRPortionAngle+angleCorrection)*(-1.0); 	// Calculate the angle of each photoreceptors, 0 - is the one to the left 
+						
+							this.photoreceptors.push(new Photoreceptor(photoAngle));													// Load the new photoreceptor
+						}
+					}
+      
+					// brain
+					//this.brain = new deepqlearn.Brain(this.eyes.length * 3, this.actions.length);
+					/*var spec = document.getElementById('qspec').value;
+					eval(spec);
+					this.brain = brain;
+      
+					this.reward_bonus = 0.0;
+					this.digestion_signal = 0.0;
+      */
+					// outputs on world
+					this.rot1 = 0.0; // rotation speed of 1st wheel
+					this.rot2 = 0.0; // rotation speed of 2nd wheel
+      
+//					this.prevactionix = -1;*/
+				}
+				
+				Agent.prototype = {
+					forward: function() {
+						// Compute the Input Layer Size
+						var numOfInputs = 0; 
+						
+						if (numOfRobotsWhiskers>0) 
+							numOfInputs += numOfRobotsWhiskers*3; 
+						else if (numOfRobotsPhotoreceptors>0) 
+							numOfInputs += numOfRobotsPhotoreceptors*3;
+						
+						// in forward pass the agent simply behaves in the environment
+						// create input to brain
+						var input_array = new Array(numOfInputs);													// Input layer
+						
+						if (numOfRobotsWhiskers>0) {
+							for(var wi=0; wi<numOfRobotsWhiskers; wi++) {
+								var wh = this.whiskers[wi];
+								input_array[wi*3] = wh.perceivedRColor;
+								input_array[wi*3+1] = wh.perceivedGColor;
+								input_array[wi*3+2] = wh.perceivedBColor;
+							}
+						} else if (numOfRobotsPhotoreceptors>0) {
+							for(var pi=0; pi<numOfRobotsPhotoreceptors; pi++) {
+								var ph = this.photoreceptors[pi];
+								input_array[wi*3] = ph.perceivedRColor;
+								input_array[wi*3+1] = ph.perceivedGColor;
+								input_array[wi*3+2] = ph.perceivedBColor;
+							}
+						}
+        
+/*						for(var pi=0; pi<numOfRobotsPhotoreceptors; pi++) {
+							//var e = this.eyes[pi];
+							//output.innerHTML += "Photoreceptor : " + pi + " : " + e.perceivedRColor + "," + e.perceivedGColor + "," + e.perceivedBColor + "  -  ";							
+							output.innerHTML += "Photoreceptor : " + pi + " : " + input_array[pi*3] + "," + input_array[pi*3+1] + "," + input_array[pi*3+2] + "  -  ";							
+						}
+						output.innerHTML += "<br>";							
+*/
+						// get action from brain
+						//var actionix = this.brain.forward(input_array);
+						
+						//var actionix = 1; 									// fixed action 
+						var actionix = Math.floor(getRandom(1, 6));				// pick a random action
+						
+						var action = this.actions[actionix];
+						//this.actionix = actionix; //back this up
+        
+						// demultiplex into behavior variables
+						this.rot1 = action[0]*1;
+						this.rot2 = action[1]*1;
+					},
+				/*	
+					backward: function() {
+						// in backward pass agent learns.
+						// compute reward 
+						var proximity_reward = 0.0;
+						var num_eyes = this.eyes.length;
+						for(var i=0;i<num_eyes;i++) {
+							var e = this.eyes[i];
+							// agents dont like to see walls, especially up close
+							proximity_reward += e.sensed_type === 0 ? e.sensed_proximity/e.max_range : 1.0;
+						}
+						proximity_reward = proximity_reward/num_eyes;
+						proximity_reward = Math.min(1.0, proximity_reward * 2);
+        
+						// agents like to go straight forward
+						var forward_reward = 0.0;
+						if(this.actionix === 0 && proximity_reward > 0.75) forward_reward = 0.1 * proximity_reward;
+        
+						// agents like to eat good things
+						var digestion_reward = this.digestion_signal;
+						this.digestion_signal = 0.0;
+        
+						var reward = proximity_reward + forward_reward + digestion_reward;
+        
+						// pass to brain for learning
+						this.brain.backward(reward);
+					}*/
+				}
+				
+				
+				// The Environment Class
+				var World = function() {
+					//this.agents = [];
+					this.agents = create2DArray(totTrials);								// Create an array with "totTrials" rows and "numOfRobots" columns
+					this.W = canvas.width;												// Environment size is the same as the canvas size
+					this.H = canvas.height;
+      
+					this.clock = 0;
+      
+					// Definition of environment's walls
+					this.walls = []; 
+
+					// Environment Initialization
+					util_add_box(this.walls, borderWallsGap, borderWallsGap, this.W-borderWallsGap*2, this.H-borderWallsGap*2);
+
+					//output.innerHTML += "<br>"+ this.walls[0].p1.x +"," + this.walls[0].p1.y + " - " + this.walls[0].p2.x +"," + this.walls[0].p2.y + "<br>";
+
+					//util_add_box(this.walls, 100, 100, 200, 300); // inner walls
+					//this.walls.pop();
+					//util_add_box(this.walls, 400, 100, 200, 300);
+					//this.walls.pop();
+      
+					// Definition of food and other items in the world
+					this.items = []
+					for(var k=0; k<numOfEnvElements; k++) {
+						var x = getRandom(elementsRadius+borderWallsGap+1, this.W-elementsRadius-borderWallsGap-1); 
+						var y = getRandom(elementsRadius+borderWallsGap+1, this.H-elementsRadius-borderWallsGap-1); 
+						
+						/*if (k==9) {
+							x=135;
+							y=130; 
+						}
+						if (k==10) {
+							x=155;
+							y=134; 
+						}*/
+						
+						//var t = Math.floor(getRandom(1, 3)); 								// food or poison (1 and 2)
+						var t = 1;							 								// food 
+						
+						var it = new Item(x, y, t);
+						this.items.push(it);
+						
+						//output.innerHTML += "<br>"+ this.items[k].p.x +"," + this.items[k].p.y + " - " + this.items[k].type + "<br>";
+					}
+				}
+				
+				World.prototype = {      
+					// helper function to get closest colliding walls/items
+					stuff_collide_: function(p1, p2, check_walls, check_items) {
+						var minres = false;
+						
+						// collide with other robots
+        
+						// collide with walls
+						/*if(check_walls) {
+							for(var i=0,n=this.walls.length;i<n;i++) {
+								var wall = this.walls[i];
+								var res = line_intersect(p1, p2, wall.p1, wall.p2);
+								if(res) {
+									res.type = 0; // 0 is wall
+									if(!minres) { minres=res; }
+									else {
+										// check if its closer
+										if(res.ua < minres.ua) {
+											// if yes replace it
+											minres = res;
+										}
+									}
+								}
+							}
+						}*/
+        
+						// collide with items
+						/*if(check_items) {
+							for(var j=0; j<numOfEnvElements; j++) {
+								//var it = this.items[j];
+								/*var res = line_point_intersect(p1, p2, it.p, it.rad);
+								if(res) {
+									res.type = it.type; // store type of item
+									if(!minres) { minres=res; }
+									else { 
+										if(res.ua < minres.ua) { minres = res; }
+									}
+								}*/
+							//}
+						//}
+        
+						return minres;
+					},
+      
+	 				tick: function() {
+					
+						// tick the environment
+						this.clock++;
+        
+						// Perception 
+						
+						// fix input to all agents based on environment
+						// process eyes
+						this.collpoints = [];
+						for (var k = 0; k < totTrials; k++) {
+							for(var i = 0; i<numOfRobots; i++) {
+								var robot = this.agents[k][i];
+								
+								if (numOfRobotsWhiskers>0) {
+									// Whiskers Perception
+									for(var wi = 0; wi<numOfRobotsWhiskers; wi++) {
+										var wh = robot.whiskers[wi];
+										var whiskerExtremity = new Vec(GetXPointAtDist(robot.p.x, wh.maxDistance, robot.angle + wh.angle), GetYPointAtDist(robot.p.y, wh.maxDistance, robot.angle + wh.angle));	// trace a line from the robot's centre position to the whisker's position
+									
+										// Whisker reset 
+										wh.perceivedRColor = 0.0;																	// Vacuum perception
+										wh.perceivedGColor = 0.0;																	// Vacuum perception
+										wh.perceivedBColor = 0.0;																	// Vacuum perception 
+										wh.objectDistance = wh.maxDistance; 														// Initial objectDistance
+
+										// perceive the items
+										for(var j=0; j<numOfEnvElements; j++) {
+											var it = this.items[j];
+											var intercept = segmentCircleIntersect(robot.p, whiskerExtremity, it.p, it.rad);		// check if the segment from the robot centre to the ray length intersects the item 
+										
+											var objDist = it.p.dist_from(robot.p);														// Distance of the detected environment's object
+											if ((intercept) && (objDist <= wh.objectDistance)) {									// as soos as it perceives something, it gets out
+												wh.perceivedRColor = it.rColor;														// Perceived Red Component 0-255
+												wh.perceivedGColor = it.gColor;														// Perceived Green Component 0-255
+												wh.perceivedBColor = it.bColor;														// Perceived Blue Component 0-255
+												wh.objectDistance = objDist;			 											// Distance between the object and the robot center 
+												break; 																				// the first object it perceives, the sensor is enabled
+											}
+										}
+									}
+								} else if (numOfRobotsPhotoreceptors>0) {
+									// Vision Perception
+									for(var pi = 0; pi<numOfRobotsPhotoreceptors; pi++) {
+										var ph = robot.photoreceptors[pi];
+										photoReceptorsResolution = Math.abs(photoReceptorsResolution); 									
+										
+										if (photoReceptorsResolution == 0) { 															// if 0 it works like whiskers
+											var photoReceptorExtremity = new Vec(GetXPointAtDist(robot.p.x, ph.maxDistance, robot.angle + ph.angle), GetYPointAtDist(robot.p.y, ph.maxDistance, robot.angle + ph.angle));	// trace a line from the robot's centre position to the whisker's position
+									
+											// Photoreceptor reset 
+											ph.perceivedRColor = 0.0;																	// Vacuum vision, dark 
+											ph.perceivedGColor = 0.0;																	// Vacuum vision, dark 
+											ph.perceivedBColor = 0.0;																	// Vacuum vision, dark 
+											ph.objectDistance = ph.maxDistance; 														// Initial objectDistance
+
+											// perceive the items
+											for(var j=0; j<numOfEnvElements; j++) {
+												var it = this.items[j];
+												var intercept = segmentCircleIntersect(robot.p, photoReceptorExtremity, it.p, it.rad);		// check if the segment from the robot centre to the ray length intersects the environment's object 
+										
+												var objDist = it.p.dist_from(robot.p);														// Distance of the detected environment's object
+												if ((intercept) && (objDist <= ph.objectDistance)) {									// as soos as it sees something, it gets out
+													ph.perceivedRColor = it.rColor;														// Perceived Red Component 0-255
+													ph.perceivedGColor = it.gColor;														// Perceived Green Component 0-255
+													ph.perceivedBColor = it.bColor;														// Perceived Blue Component 0-255
+													ph.objectDistance = objDist;														// Distance between the object and the robot center, its the min distance 
+													break; 																				// the first object it sees, the sensor is enabled
+												}
+											}
+										} else {
+											// Calculate all the angles corrections in the case the number of photoreceptors is even
+											var photoRPortionAngle=robotsFOV / numOfRobotsPhotoreceptors; 								// The angle managed by each photoreceptor
+											if (numOfRobotsPhotoreceptors % 2==0)														// If the number of photoreceptors is even then add a correction to the angle	
+												var angleCorrection = photoRPortionAngle / 2.0; 
+											else 
+												var angleCorrection = photoRPortionAngle / 2.0; 
+
+											var photoAngle = robot.oangle + ph.angle + angleCorrection;
+											
+											// Photoreceptor reset 
+											ph.perceivedRColor = 0.0;																	// Vacuum vision, dark 
+											ph.perceivedGColor = 0.0;																	// Vacuum vision, dark 
+											ph.perceivedBColor = 0.0;																	// Vacuum vision, dark 
+											ph.objectDistance = ph.maxDistance; 														// Initial objectDistance
+											
+											// send a stream of beams
+											for (var piAR = 0; piAR < photoRPortionAngle; piAR += photoReceptorsResolution) {			// scan the space with many beams
+												var photoReceptorExtremity = new Vec(GetXPointAtDist(robot.p.x, ph.maxDistance, photoAngle+piAR-photoRPortionAngle), GetYPointAtDist(robot.p.y, ph.maxDistance, photoAngle+piAR-photoRPortionAngle));	// trace a line from the robot's centre position to the photoReceptor's position
+										
+												for(var j=0; j<numOfEnvElements; j++) {													// Check all the objects and take the one with minimum distance	
+													var it = this.items[j];
+
+													var intercept = segmentCircleIntersect(robot.p, photoReceptorExtremity, it.p, it.rad);	// check if the segment from the robot centre to the ray length intersects the environment's object
+													
+													var objDist = it.p.dist_from(robot.p);													// Distance of the detected environment's object
+													// policy: the chosen element is the closest one to the photoreceptor
+													if ((intercept) && (objDist <= ph.objectDistance)) {								// as soos as it sees something, it gets out
+														ph.perceivedRColor = it.rColor;													// Perceived Red Component 0-255
+														ph.perceivedGColor = it.gColor;													// Perceived Green Component 0-255
+														ph.perceivedBColor = it.bColor;													// Perceived Blue Component 0-255
+														ph.objectDistance = objDist;													// Distance between the object and the robot center, its the min distance 
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+
+						// Neural network spreading 
+						
+						// let the agents behave in the world based on their input
+						// loop on all the Individuals on all the trials
+						for (var k = 0; k < totTrials; k++) {
+							for (var i = 0; i<numOfRobots; i++) {
+								this.agents[k][i].forward();
+							}
+						}
+						
+						// Motion 
+						
+						if (runOnGPU) {																				// GPU Support
+							// Robots array linearization to input it
+							// Maybe after times evaluations, remove these loops and straightforward use linear robots and no agents[]
+							for (var k = 0; k < totTrials; k++) {
+								for (var i = 0; i < numOfRobots; i++) {
+									// Linearization
+									robotIndex = i*numOfRobotsParams+k*numOfRobots*numOfRobotsParams;
+								
+									robots[robotIndex] = this.agents[k][i].p.x;													// First field
+									robots[1+robotIndex] = this.agents[k][i].p.y;			
+								
+									robots[2+robotIndex] = this.agents[k][i].op.x;
+									robots[3+robotIndex] = this.agents[k][i].op.y;			
+									robots[4+robotIndex] = this.agents[k][i].angle;			
+									robots[5+robotIndex] = this.agents[k][i].oangle;			
+									robots[6+robotIndex] = this.agents[k][i].rad;			
+									robots[7+robotIndex] = this.agents[k][i].rot1;			
+									robots[8+robotIndex] = this.agents[k][i].rot2;			
+
+									//output.innerHTML += "Robot " + i + " : " + robots[robotIndex].toFixed(visualizationPrec) + " , " + robots[1+robotIndex].toFixed(visualizationPrec) + "    |    ";							
+									
+									
+								}
+								//output.innerHTML += "<br>";
+							}
+
+							// Write the buffer to OpenCL device memory
+							motionRobotsQueue.enqueueWriteBuffer(clRobotsBuffer, false, 0, bufRobotsSize, robots);
+
+							//if (!disableOutput) {
+							//	output.innerHTML += "<br>Global work item size: " + motionGlobalWS;
+							//	output.innerHTML += "<br><br>";
+							//}
+
+							// Execute (enqueue) kernel
+							motionRobotsQueue.enqueueNDRangeKernel(motionKernel, motionGlobalWS.length, null, motionGlobalWS, null);
+						
+							// Read the result buffer from OpenCL device
+							motionRobotsQueue.enqueueReadBuffer(clRobotsBuffer, false, 0, bufRobotsSize, robots);    
+							motionRobotsQueue.finish(); 															//Finish all the operations
+
+							// apply robots actions
+							for (var k = 0; k < totTrials; k++) {
+								for (var i = 0; i<numOfRobots; i++) {
+									var a = this.agents[k][i];
+          
+									// Delinearization
+									robotIndex = i*numOfRobotsParams+k*numOfRobots*numOfRobotsParams;
+
+									a.p = new Vec(robots[robotIndex], robots[1+robotIndex]); 						// we must absolutely use "new Vec" here
+									a.op = new Vec(robots[2+robotIndex], robots[3+robotIndex]); 			
+									a.angle = robots[4+robotIndex];
+									a.oangle = robots[5+robotIndex];			
+									a.rad = robots[6+robotIndex];			
+									a.rot1 = robots[7+robotIndex];			
+									a.rot2 = robots[8+robotIndex];			
+								}
+							}
+
+						} else {																					// No GPU Support
+							// apply robots actions
+							for (var k = 0; k < totTrials; k++) {
+								for (var i = 0; i<numOfRobots; i++) {
+									var a = this.agents[k][i];
+									a.op = a.p; 														// back up old position
+									a.oangle = a.angle; 												// and angle
+									
+									// move and turn the robot according to the wheel velocities
+									// first take the position of the point between the front and the center of the robot (0, a.rad / 2.0)
+									// then the position of the left wheel, if the robot pos was 0,0 , that is the previous point rotated of the robot angle + 90 degrees		
+									var leftWheelPos = a.p.add((new Vec(0, a.rad / 2.0)).rotate(a.angle + Math.PI/2)); 							// determine the absolute position of the left wheel, adding the robot central position to ideal wheel position
+									var rightWheelPos = a.p.sub((new Vec(0, a.rad / 2.0)).rotate(a.angle + Math.PI/2));							// determine the absolute position of the right wheel, that is on the opposite side
+						
+									var rightWheelMove = rightWheelPos.add(a.p.sub(rightWheelPos).rotate(-a.rot1));
+									rightWheelMove.scale(0.5);
+									var leftWheelMove = leftWheelPos.add(a.p.sub(leftWheelPos).rotate(a.rot2));
+									leftWheelMove.scale(0.5);
+									a.p = rightWheelMove.add(leftWheelMove);							// Add the right wheel move component with the left wheel move component	
+				
+									a.angle -= a.rot1;
+									if(a.angle<0)														// Angle correction if negative	
+										a.angle+=2*Math.PI;
+									a.angle += a.rot2;
+									if(a.angle>2*Math.PI)												// Angle correction if over 2PI
+										a.angle-=2*Math.PI;
+
+									// handle boundary conditions
+									if (a.p.x<borderWallsGap+a.rad+1)	
+										a.p.x=borderWallsGap+a.rad+1;
+									if (a.p.x>this.W-borderWallsGap-a.rad-1)
+										a.p.x=this.W-borderWallsGap-a.rad-1;
+									if (a.p.y<borderWallsGap+a.rad+1)
+										a.p.y=borderWallsGap+a.rad+1;
+									if (a.p.y>this.H-borderWallsGap-a.rad-1)
+										a.p.y=this.H-borderWallsGap-a.rad-1;
+									
+									//output.innerHTML += "Robot " + a.number + " : " + a.p.x.toFixed(visualizationPrec) + " , " + a.p.y.toFixed(visualizationPrec) + "    |    ";							
+								}
+							}
+							//output.innerHTML += "<br>";
+						}
+			
+						// Collisions manager
+						// maybe it can be parallelized too
+							// agent is trying to move from p to op. Check walls
+		/*					var res = this.stuff_collide_(a.op, a.p, true, false);
+							if(res) {
+								// wall collision! reset position
+								a.p = a.op;
+							}
+         */
+        /*
+						// tick all items
+						var update_items = false;
+						for(var i=0,n=this.items.length;i<n;i++) {
+							var it = this.items[i];
+							it.age += 1;
+          
+							// see if some agent gets lunch
+							for(var j=0,m=this.agents.length;j<m;j++) {
+								var a = this.agents[j];
+								var d = a.p.dist_from(it.p);
+								if(d < it.rad + a.rad) {
+              
+									// wait lets just make sure that this isn't through a wall
+									var rescheck = this.stuff_collide_(a.p, it.p, true, false);
+									if(!rescheck) { 
+										// ding! nom nom nom
+										if(it.type === 1) a.digestion_signal += 5.0; // mmm delicious apple
+										if(it.type === 2) a.digestion_signal += -6.0; // ewww poison
+										it.cleanup_ = true;
+										update_items = true;
+										break; // break out of loop, item was consumed
+									}
+								}
+							}
+          
+							if(it.age > 5000 && this.clock % 100 === 0 && convnetjs.randf(0,1)<0.1) {
+								it.cleanup_ = true; // replace this one, has been around too long
+								update_items = true;
+							}
+						}
+						
+						if(update_items) {
+							var nt = [];
+							for(var i=0,n=this.items.length;i<n;i++) {
+								var it = this.items[i];
+								if(!it.cleanup_) nt.push(it);
+							}
+							this.items = nt; // swap
+						}
+						
+						if(this.items.length < 30 && this.clock % 10 === 0 && convnetjs.randf(0,1)<0.25) {
+							var newitx = convnetjs.randf(20, this.W-20);
+							var newity = convnetjs.randf(20, this.H-20);
+							var newitt = convnetjs.randi(1, 3); // food or poison (1 and 2)
+							var newit = new Item(newitx, newity, newitt);
+							this.items.push(newit);
+						}
+        
+						// agents are given the opportunity to learn based on feedback of their action on environment
+						for(var i=0,n=this.agents.length;i<n;i++) {
+							this.agents[i].backward();
+						}*/
+					}
+				}
+				
+				// Draw everything
+				function draw() {  
+					ctx.clearRect(0, 0, canvas.width, canvas.height);
+					ctx.lineWidth = 3;
+					//var agents = w.agents;
+      
+					// draw walls in environment
+					ctx.strokeStyle = "rgb(0,0,0)";
+					ctx.beginPath();
+					for(var i = 0; i < w.walls.length; i++) {
+						ctx.moveTo(w.walls[i].p1.x, w.walls[i].p1.y);
+						ctx.lineTo(w.walls[i].p2.x, w.walls[i].p2.y);
+					}
+					ctx.stroke();
+    
+					// draw items
+					ctx.lineWidth = 3;
+					ctx.strokeStyle = "rgb(0,0,0)";
+					for(var i = 0; i < numOfEnvElements; i++) {
+						var it = w.items[i];
+						if(it.type === 1) 
+							ctx.fillStyle = "rgb(" + it.rColor + "," + it.gColor + "," + it.bColor + ")"; 								// Set the Robot's color already set during the parameters initialization 
+						if(it.type === 2) 
+							ctx.fillStyle = "rgb(255, 150, 150)";
+						ctx.beginPath();
+						ctx.arc(it.p.x, it.p.y, it.rad, 0, Math.PI*2, true); 
+						ctx.fill();
+						ctx.stroke();
+					}
+					
+					// draw robots
+					// color agent based on reward it is experiencing at the moment
+					//var r = Math.floor(agents[0].brain.latest_reward * 200);
+					//if(r>255)r=255;if(r<0)r=0;
+					for(var i = 0; i < w.agents[currentTrial].length; i++) {
+						ctx.lineWidth = 3;
+						ctx.strokeStyle = "rgb(0,0,0)";
+						robot = w.agents[currentTrial][i];
+
+						/*var robotsGradient=ctx.createLinearGradient(0,0,170,0);
+						robotsGradient.addColorStop("0","magenta");
+						robotsGradient.addColorStop("0.5","blue");
+						robotsGradient.addColorStop("1.0","red");				*/
+						
+						ctx.fillStyle = "rgb(" + robot.rColor + "," + robot.gColor + "," + robot.bColor + ")"; 							// Set the Robot's color already set during the parameters initialization 
+
+						//ctx.fillStyle = robotsGradient; 											// Set the Robot's color already set during the parameters initialization 
+					
+						// draw robots body
+						ctx.beginPath();
+						ctx.arc(robot.op.x, robot.op.y, robot.rad, 0, Math.PI*2, true); 
+						ctx.fill();
+						ctx.stroke();
+						
+						// mark robots' face direction
+						ctx.beginPath();
+						ctx.moveTo(robot.op.x, robot.op.y);
+						ctx.lineTo(GetXPointAtDist(robot.op.x, robot.rad, robot.oangle), GetYPointAtDist(robot.op.y, robot.rad, robot.oangle));   
+						ctx.stroke();
+												
+						if (numOfRobotsWhiskers>0) {
+							// draw robots whiskers
+							for(var wi = 0; wi<numOfRobotsWhiskers; wi++) {
+								var wh = robot.whiskers[wi];
+							
+								output.innerHTML += "Sensor : " + wi + " - " + wh.perceivedRColor + " , " + wh.perceivedGColor + " , " + wh.perceivedBColor + "   <br>     ";							
+
+								ctx.beginPath();
+								ctx.lineWidth = 3;
+								ctx.strokeStyle = "rgb(" + wh.perceivedRColor + "," + wh.perceivedGColor + "," + wh.perceivedBColor + ")"; 
+								ctx.moveTo(GetXPointAtDist(robot.op.x, robot.rad, robot.oangle + wh.angle), GetYPointAtDist(robot.op.y, robot.rad, robot.oangle + wh.angle));
+								ctx.lineTo(GetXPointAtDist(robot.op.x, wh.maxDistance, robot.oangle + wh.angle), GetYPointAtDist(robot.op.y, wh.maxDistance, robot.oangle + wh.angle));
+								ctx.stroke();
+							}
+						} else if (numOfRobotsPhotoreceptors>0) {
+							var firstAngle, lastAngle;
+							
+							// Calculate all the angles corrections
+							var photoRPortionAngle=robotsFOV / numOfRobotsPhotoreceptors; 														// The angle managed by each photoreceptor
+							if (numOfRobotsPhotoreceptors % 2==0)																				// If the number of photoreceptors is even then add a correction to the angle	
+								angleCorrection = photoRPortionAngle / 2.0; 
+							else 
+								angleCorrection = photoRPortionAngle / 2.0; 
+
+							ctx.beginPath();
+							ctx.lineWidth = 1;
+							// Draw the retina 
+							for(var pi = 0; pi<numOfRobotsPhotoreceptors+1; pi++) {
+
+								if (pi<numOfRobotsPhotoreceptors) {
+									var ph = robot.photoreceptors[pi];
+									var photoAngle = robot.oangle + ph.angle + angleCorrection;
+								}
+									
+								// Save first and last angle, and manage the last tick 
+								if (pi==0) 
+									firstAngle = photoAngle; 																			
+								else if (pi==numOfRobotsPhotoreceptors)	{																	// for the last tick 	
+									photoAngle -= angleCorrection*2.0; 
+									lastAngle = photoAngle;
+								}
+								ctx.moveTo(GetXPointAtDist(robot.op.x, robot.rad-10, photoAngle), GetYPointAtDist(robot.op.y, robot.rad-10, photoAngle));
+								ctx.strokeStyle = "rgb(0,0,0)";
+								ctx.lineTo(GetXPointAtDist(robot.op.x, robot.rad, photoAngle), GetYPointAtDist(robot.op.y, robot.rad, photoAngle));
+								ctx.stroke();
+							}
+							ctx.beginPath();
+							ctx.lineWidth = 1;
+							ctx.moveTo(GetXPointAtDist(robot.op.x, robot.rad-10, firstAngle), GetYPointAtDist(robot.op.y, robot.rad-10, firstAngle));
+							ctx.strokeStyle = "rgb(0,0,0)";
+							ctx.lineTo(GetXPointAtDist(robot.op.x, robot.rad-10, lastAngle), GetYPointAtDist(robot.op.y, robot.rad-10, lastAngle));
+							//ctx.arc(robot.op.x, robot.op.y, robot.rad-10, 3.0 * Math.PI / 4.0 - firstAngle - lastAngle - robot.oangle, -robot.oangle - firstAngle - lastAngle, true); 
+							ctx.stroke();
+
+							// Draw the photoreceptor activation 
+							if (photoReceptorsResolution == 0) {																				// if 0 it works like whiskers
+								for(var pi = 0; pi<numOfRobotsPhotoreceptors; pi++) {
+									var ph = robot.photoreceptors[pi];
+							
+									ctx.beginPath();
+									ctx.lineWidth = 1;
+									ctx.strokeStyle = "rgb(" + ph.perceivedRColor + "," + ph.perceivedGColor + "," + ph.perceivedBColor + ")"; 
+									ctx.moveTo(GetXPointAtDist(robot.op.x, robot.rad, robot.oangle + ph.angle), GetYPointAtDist(robot.op.y, robot.rad, robot.oangle + ph.angle));
+									ctx.lineTo(GetXPointAtDist(robot.op.x, ph.maxDistance, robot.oangle + ph.angle), GetYPointAtDist(robot.op.y, ph.maxDistance, robot.oangle + ph.angle));
+									ctx.stroke();
+								}
+							} else {
+								for(var pi = 0; pi<numOfRobotsPhotoreceptors; pi++) {
+									var ph = robot.photoreceptors[pi];
+
+									if (photoReceptorsRayMaxLength>0)																			// decide the beam length	
+										var beamLength = photoReceptorsRayMaxLength + robot.rad;
+									else
+										var beamLength = ph.objectDistance; 
+								
+									var photoAngle = robot.oangle + ph.angle + angleCorrection;
+
+									for (var piAR = 0; piAR < photoRPortionAngle; piAR += photoReceptorsResolution) {
+										if (!((ph.perceivedRColor==0) && (ph.perceivedGColor==0) && (ph.perceivedBColor==0))) {					// display only if it sees something
+											ctx.beginPath();
+											ctx.lineWidth = 1;
+											ctx.moveTo(GetXPointAtDist(robot.op.x, robot.rad-10, photoAngle+piAR - photoRPortionAngle), GetYPointAtDist(robot.op.y, robot.rad-10, photoAngle+piAR - photoRPortionAngle));
+											ctx.strokeStyle = "rgb(" + ph.perceivedRColor + "," + ph.perceivedGColor + "," + ph.perceivedBColor + ")";
+											ctx.lineTo(GetXPointAtDist(robot.op.x, beamLength, photoAngle+piAR  - photoRPortionAngle), GetYPointAtDist(robot.op.y,  beamLength, photoAngle+piAR - photoRPortionAngle));
+											ctx.fill(); 
+											ctx.stroke();
+										}
+									}
+
+									//output.innerHTML += "Sensor : " + pi + " - " + ph.perceivedRColor + " , " + ph.perceivedGColor + " , " + ph.perceivedBColor + "   <br>     ";							
+								}
+							}
+						}
+					}
+      
+      
+					//w.agents[0].brain.visSelf(document.getElementById('brain_info_div'));
+				}	
+
+				// Draw the world
+				function tick() {
+					
+					try {
+						var startT = performance.now();																
+						w.tick();
+						var endT = performance.now();																			// Catch the elapsed time
+						var elapsedTime = endT - startT; 																		// try to understand mistery of times CPU-GPU	
+
+						if (blinkingRobots) {																					// If blinking it changes color every time step
+							for (var k = 0; k < totTrials; k++) {
+								for (var i = 0; i<numOfRobots; i++) {
+									var robot = w.agents[k][i];
+									robot.rColor = Math.floor(getRandom(0, 256));								// Red component of the robot's colour
+									robot.gColor = Math.floor(getRandom(0, 256));								// Green component of the robot's colour
+									robot.bColor = Math.floor(getRandom(0, 256));								// Blue component of the robot's colour
+								}
+							}
+						}
+						//if(!skipdraw || w.clock % 50 === 0) {																
+							draw();
+
+						/*if (!disableOutput) {
+							output.innerHTML += "<br>Time step : " + w.clock + "<br>"; 
+							for (var k = 0; k < totTrials; k++) {
+								output.innerHTML += "Trial " + k + " ---&gt " 
+								for (var i = 0; i < numOfRobots; i++) {
+									var a = w.agents[k][i];
+
+									output.innerHTML += "Robot " + a.number + " : " + a.p.x.toFixed(visualizationPrec) + " , " + a.p.y.toFixed(visualizationPrec) + "    |    ";							
+								}
+								output.innerHTML += "<br>";
+							}
+							output.innerHTML += "Elapsed Time : " + elapsedTime.toFixed(visualizationPrec+1) + " ms  ";							
+							output.innerHTML += "<br>";
+						}*/
+
+						// Exit condition 
+						if (w.clock >= totTimeSteps) 
+							clearInterval(current_interval_id); 
+						
+						//	draw_stats();
+						//	draw_net();
+						//}
+					} catch (exception) {
+						if (!disableWarnings) {
+							output.innerHTML += "<h3>ERROR: </h3><pre style=\"color:red;\">" + exception.message +"</pre>";
+							output.innerHTML += "<h3>Line Number: </h3><pre style=\"color:red;\">" + exception.lineNumber +"</pre><br>";
+						}
+						throw exception;
+						return false; 
+					}
+
+				}
+				
+				// Run a Test of evolved robots
+				function runTest() {
+
+					try {
+						// All the output is written as HTML 
+						var output = document.getElementById("output");
+						output.innerHTML = "";
+
+						// Read parameters set by HTML
+						var numOfRobotsHtml = document.getElementById("robots").value;
+						if (numOfRobotsHtml>0)
+							numOfRobots = numOfRobotsHtml;
+						var totTrialsHtml = document.getElementById("trials").value;
+						if (totTrialsHtml>0)
+							totTrials = totTrialsHtml;
+						var totTimeStepsHtml = document.getElementById("timesteps").value;
+						if (totTimeStepsHtml>0)
+							totTimeSteps = totTimeStepsHtml;
+			
+						var runOnGPUHtml = document.getElementById("GPU").checked;
+						if (runOnGPUHtml == true)
+							runOnGPU = 1;
+						else 
+							runOnGPU = 0;
+							
+						var simOutputHtml = document.getElementById("SimOutput").checked;
+						//output.innerHTML += "Output " + simOutputHtml;							
+						/*if (simOutputHtml == true)
+							disableOutput = 0;
+						else 
+							disableOutput = 1;*/
+							
+						var simWarningsHtml = document.getElementById("SimWarnings").checked;
+						//output.innerHTML += "Warnings " + simWarningsHtml;							
+						if (simWarningsHtml == true)
+							disableWarnings = 0;
+						else 
+							disableWarnings = 1;
+						
+						
+						// Display Area 
+						canvas = document.getElementById("canvas");
+						ctx = canvas.getContext("2d");
+      
+						// Initialization of the World 
+						w = new World();
+						//w.agents = [];
+						w.agents = create2DArray(totTrials); 												// Create an array with "totTrials" rows and "numOfRobots" columns
+						
+						// Initialization of Robots parameters
+						// loop on all the Individuals
+						if (!disableOutput) {
+							output.innerHTML += "<br><br>Initial parameters : <br><br>";
+							for (var k = 0; k < totTrials; k++) {
+								output.innerHTML += "Trial " + k + " ---&gt " 
+								for (var i = 0; i<numOfRobots; i++) {
+									w.agents[k].push(new Agent(i));
+								
+									output.innerHTML += "Robot " + w.agents[k][i].number + " : " + w.agents[k][i].p.x.toFixed(visualizationPrec) + " , " + w.agents[k][i].p.y.toFixed(visualizationPrec) + " , " + w.agents[k][i].angle.toFixed(visualizationPrec) + "    |    ";							
+								
+								}
+								output.innerHTML += "<br>";
+							}
+						}
+						
+						// GPU routines
+						if (runOnGPU) {																		// GPU Support
+							//motionGlobalWS = [totTrials, numOfRobots];									// Set Initial Motion ND-range			
+
+							//output.innerHTML += "ND-Range : "+motionGlobalWS;
+
+							// At the moment we use a linear array like the following, which fosters data buffering. ArrayBufferView type - linear array
+							if (typesNBit==4) 
+								robots=new Float64Array(numOfRobotsParams * numOfRobots * totTrials);		// Uses all 64 bit floats if the kernel uses double 	
+							else if(typesNBit==32)
+								robots=new Float32Array(numOfRobotsParams * numOfRobots * totTrials);		// Uses all 32 bit floats if the kernel uses float	
+							else {
+								alert ("Buffer Sizing Error : "
+								+ "Make sure that you set 32 or 64 bit on the variable - typesNBit -");
+								return false; 
+							}
+
+							numOfRobotsElements = robots.length;
+
+							// Reserve buffers
+							bufRobotsSize = numOfRobotsElements * typesNBit / 8; 					// size in bytes, use 4 for 32 bit, 8 for 64 bit 
+
+							// First check if the WebCL extension is installed at all
+							if ((window.webcl == undefined) && (runOnGPU))  {
+								/*alert("Unfortunately your system does not support WebCL. " +
+									"Make sure that you have both the OpenCL driver " +
+									"and the WebCL browser extension installed.");*/
+
+								var r = confirm("Unfortunately your system does not support WebCL.\n\n " +
+												"Only Firefox supports WebCL at moment.\n "+
+												"If you press - OK - you will be redirect to \"WebCL Extension's Download Page\" for Firefox.\n"+
+												"Notice: you need OpenCL driver installed, first.");
+								if (r == true) {
+									window.location.href="http://webcl.nokiaresearch.com/extensions/firefox/multiplatform/latest/webcl-1.0.xpi";
+								} 
+									
+								/*var answer = confirm ("Please click on OK to continue.")
+								if (answer)
+									window.location="http://www.repubblica.com";
+								}*/	
+								return false;
+							}
+
+							if (!disableOutput) {
+								output.innerHTML += "<br>Robots Buffer size: " + bufRobotsSize + " bytes";
+
+								output.innerHTML += "<br>Number of Robots array elements : " + numOfRobotsElements;
+								output.innerHTML += "<br><br>";
+							}
+
+							// Perception WebCL settings
+
+							// Neural Networks WebCL settings
+
+							// Motion WebCL settings
+							
+							motionContext = webcl.createContext();																			// Setup WebCL context using the default device
+							clRobotsBuffer = motionContext.createBuffer (WebCL.MEM_READ_WRITE | WebCL.CL_MEM_COPY_HOST_PTR, bufRobotsSize); // WebCL buffer for robots array
+
+							// Create and build a program for the first device of the platform, as far as Motion concerns
+							motionKernelSrc = loadKernel("clMoveRobot");																	// Load the motion kernel source 
+							motionProgram = motionContext.createProgram(motionKernelSrc);													// Create the motion program 
+							motionDevice = motionContext.getInfo(WebCL.CONTEXT_DEVICES)[0];													// Read the motion device
+
+							try {
+								motionProgram.build ([motionDevice], "");																	// Build the motion program 
+							} catch(exception) {
+								alert ("Failed to build WebCL program. Error "
+								+ motionProgram.getBuildInfo (motionDevice, WebCL.PROGRAM_BUILD_STATUS)
+								+ ":  " + motionProgram.getBuildInfo (motionDevice, WebCL.PROGRAM_BUILD_LOG));
+								return false; 
+								throw exception;
+							}
+
+							// Create kernel and set arguments
+							motionKernel = motionProgram.createKernel ("moveRobot");														// Create the motion kernel 	
+							motionKernel.setArg (0, clRobotsBuffer);
+							motionKernel.setArg (1, new Uint32Array([numOfRobotsParams]));
+							motionKernel.setArg (2, new Uint32Array([numOfRobots]));
+							motionKernel.setArg (3, new Float32Array([w.W]));
+							motionKernel.setArg (4, new Float32Array([w.H]));
+							motionKernel.setArg (5, new Float32Array([borderWallsGap]));
+
+							motionRobotsQueue = motionContext.createCommandQueue(motionDevice);												// Create command queue using the first available device for the robots motion
+						}
+						
+						if (!disableOutput) {
+							output.innerHTML += "<br>Number of Robots : " + numOfRobots;
+							output.innerHTML += "<br>Number of Trials : " + totTrials;
+						
+							output.innerHTML += "<br>";
+						}
+						
+						if (runOnGPU)
+							var simulationSpeed = GPUSimulationSpeed;
+						else
+							var simulationSpeed = CPUSimulationSpeed;
+														
+						window.clearInterval(current_interval_id);
+						current_interval_id = setInterval(tick, simulationSpeed);
+						skipdraw = false;
+						//simspeed = 2;
+		
+						
+					} catch (exception) {
+						if (!disableWarnings) {
+							output.innerHTML += "<h3>ERROR: </h3><pre style=\"color:red;\">" + exception.message +"</pre>";
+							output.innerHTML += "<h3>Line Number: </h3><pre style=\"color:red;\">" + exception.lineNumber +"</pre><br>";
+						}
+						throw exception;
+						return false; 
+					}
+                }
+
+			</script>
+
+            
+			<div><br></div>
+			<b><label class="underline">Number of Robots : </label></b>
+			<input type="text" name="robots" id="robots" autofocus required size="4" value="12"/>
+			<br>
+			<b><label class="underline">Number of Trials : </label></b>
+			<input type="text" name="trials" id="trials" autofocus required size="4" value="1"/>
+			<br>
+			<b><label class="underline">Number of Time Steps : </label></b>
+			<input type="text" name="timesteps" id="timesteps" autofocus required size="4" value="5000"/>
+			<br><br>
+			<b><label class="bold">Compute Unit : </label></b>
+			<input type="radio" name="computeUnit" id="CPU" checked="checked"/>
+			<label class="underline" for="CPU">CPU</label>
+			<input type="radio" name="computeUnit" id="GPU" />
+			<label class="underline" for="GPU">GPU</label>
+			<br><br>
+			<b><label class="underline" for="SimOutput">Display the Simulation Output</label></b>
+			<input type="checkbox" name="SimOutput" id="SimOutput" />
+			<b><label class="underline" > ---- </label></b>
+			<b><label class="underline" for="SimWarnings">Display the Simulation Warnings</label></b>
+			<input type="checkbox" name="SimWarnings" id="SimWarnings" />
+			<br><br>
+			<input type="button" value="Test the Evolved Robots" onclick="runTest()"> 
+			<div><br></div>
+			<canvas id="canvas" width="900" height="600"></canvas>
+			<!-- <input type="button" value="Run the Test without GPU" onclick="display()"> -->
+
+			<div id="output"></div>
+			 
+			 
+            </div> 
+      <!-- </div> -->
+
+    </div>
+    <!-- end div#content -->
+
+    <div style="clear: both; height: 1px"></div>
+  </div>
+</div> <!-- end div#page -->
+
+
+<script type="text/javascript">
+  var _gaq = _gaq || [];
+  _gaq.push(['_setAccount', 'UA-22607782-1']);
+  _gaq.push(['_trackPageview']);
+  (function() {
+    var ga = document.createElement('script'); ga.type = 'text/javascript'; ga.async = true;
+    ga.src = ('https:' == document.location.protocol ? 'https://ssl' : 'http://www') + '.google-analytics.com/ga.js';
+    var s = document.getElementsByTagName('script')[0]; s.parentNode.insertBefore(ga, s);
+  })();
+</script>
+
+
+</body></html>
